@@ -455,7 +455,7 @@ class GenerationHandler:
         last_heartbeat_time = start_time  # Track last heartbeat for image generation
         heartbeat_interval = 10  # Send heartbeat every 10 seconds for image generation
         last_status_output_time = start_time  # Track last status output time for video generation
-        video_status_interval = 30  # Output status every 30 seconds for video generation
+        video_status_interval = 5  # Output status every 5 seconds for video generation (optimized for better UX)
 
         debug_logger.log_info(f"Starting task polling: task_id={task_id}, is_video={is_video}, timeout={timeout}s, max_attempts={max_attempts}")
 
@@ -503,22 +503,32 @@ class GenerationHandler:
                     for task in pending_tasks:
                         if task.get("id") == task_id:
                             task_found = True
-                            # Update progress
+                            # Get status first
+                            status = task.get("status", "processing")
+                            
+                            # Update progress with intelligent null handling
                             progress_pct = task.get("progress_pct")
-                            # Handle null progress at the beginning
                             if progress_pct is None:
-                                progress_pct = 0
+                                # For queued status, show 0%; for other statuses, keep last progress
+                                if status == "queued":
+                                    progress_pct = 0
+                                else:
+                                    progress_pct = last_progress if last_progress > 0 else 0
                             else:
                                 progress_pct = int(progress_pct * 100)
 
-                            # Update last_progress for tracking
-                            last_progress = progress_pct
-                            status = task.get("status", "processing")
-
-                            # Output status every 30 seconds (not just when progress changes)
+                            # Output status when progress changes or time interval is reached
                             current_time = time.time()
-                            if stream and (current_time - last_status_output_time >= video_status_interval):
+                            should_output = (
+                                stream and (
+                                    progress_pct != last_progress or  # Progress changed
+                                    (current_time - last_status_output_time >= video_status_interval)  # Time interval reached
+                                )
+                            )
+                            
+                            if should_output:
                                 last_status_output_time = current_time
+                                last_progress = progress_pct  # Update last_progress only when output
                                 debug_logger.log_info(f"Task {task_id} progress: {progress_pct}% (status: {status})")
                                 yield self._format_stream_chunk(
                                     reasoning_content=f"**Video Generation Progress**: {progress_pct}% ({status})\n"
@@ -534,6 +544,64 @@ class GenerationHandler:
                         # Find matching task in drafts
                         for item in items:
                             if item.get("task_id") == task_id:
+                                # Check task status (whitelist approach: only sora_draft is success)
+                                kind = item.get("kind")
+                                
+                                if kind != "sora_draft":
+                                    # Handle different failure types
+                                    if kind == "sora_content_violation":
+                                        reason_str = item.get("reason_str") or item.get("markdown_reason_str") or "Content policy violation"
+                                        error_msg = f"Video generation failed: {reason_str}"
+                                    else:
+                                        # Unknown failure type
+                                        error_msg = f"Video generation failed with status: {kind or 'unknown'}"
+                                    
+                                    debug_logger.log_error(
+                                        error_message=error_msg,
+                                        status_code=400,
+                                        response_text=str(item)
+                                    )
+                                    await self.db.update_task(task_id, "failed", 0, error_message=error_msg)
+                                    
+                                    # Stream mode: yield error chunk instead of raising
+                                    if stream:
+                                        # Send error in reasoning_content (without finish_reason) so frontend can detect it
+                                        yield self._format_stream_chunk(
+                                            reasoning_content=f"❌ {error_msg}\n"
+                                        )
+                                        # Then send final chunk with finish_reason
+                                        yield self._format_stream_chunk(
+                                            content="",
+                                            finish_reason="stop"
+                                        )
+                                        yield "data: [DONE]\n\n"
+                                    return
+                                
+                                # Double check: verify video URL exists
+                                url = item.get("downloadable_url") or item.get("url")
+                                if not url:
+                                    error_msg = "Video generation completed but no download URL found"
+                                    debug_logger.log_error(
+                                        error_message=error_msg,
+                                        status_code=500,
+                                        response_text=str(item)
+                                    )
+                                    await self.db.update_task(task_id, "failed", 0, error_message=error_msg)
+                                    
+                                    # Stream mode: yield error chunk instead of raising
+                                    if stream:
+                                        # Send error in reasoning_content (without finish_reason) so frontend can detect it
+                                        yield self._format_stream_chunk(
+                                            reasoning_content=f"❌ {error_msg}\n"
+                                        )
+                                        # Then send final chunk with finish_reason
+                                        yield self._format_stream_chunk(
+                                            content="",
+                                            finish_reason="stop"
+                                        )
+                                        yield "data: [DONE]\n\n"
+                                    return
+                                
                                 # Check if watermark-free mode is enabled
                                 watermark_free_config = await self.db.get_watermark_free_config()
                                 watermark_free_enabled = watermark_free_config.watermark_free_enabled
@@ -697,6 +765,24 @@ class GenerationHandler:
                                                     reasoning_content="**Video Generation Completed**\n\nCache is disabled. Using original URL directly...\n"
                                                 )
 
+                                # Extract thumbnail and gif from encodings
+                                thumbnail_url = None
+                                gif_url = None
+                                post_id_final = None
+                                
+                                encodings = item.get("encodings", {})
+                                thumbnail_obj = encodings.get("thumbnail")
+                                if thumbnail_obj and isinstance(thumbnail_obj, dict):
+                                    thumbnail_url = thumbnail_obj.get("path")
+                                
+                                gif_obj = encodings.get("gif")
+                                if gif_obj and isinstance(gif_obj, dict):
+                                    gif_url = gif_obj.get("path")
+                                
+                                # Get post_id if watermark-free mode was used
+                                if watermark_free_enabled and 'post_id' in locals():
+                                    post_id_final = post_id
+
                                 # Task completed
                                 await self.db.update_task(
                                     task_id, "completed", 100.0,
@@ -704,9 +790,23 @@ class GenerationHandler:
                                 )
 
                                 if stream:
+                                    # Build video HTML with thumbnail
+                                    video_html = f"<video src='{local_url}' controls"
+                                    if thumbnail_url:
+                                        video_html += f" poster='{thumbnail_url}'"
+                                    video_html += "></video>"
+                                    
+                                    # Include thumbnail, gif, and postId in JSON for frontend parsing
+                                    metadata_json = json.dumps({
+                                        "videoUrl": local_url,
+                                        "thumbnailUrl": thumbnail_url,
+                                        "gifUrl": gif_url,
+                                        "postId": post_id_final
+                                    })
+                                    
                                     # Final response with content
                                     yield self._format_stream_chunk(
-                                        content=f"```html\n<video src='{local_url}' controls></video>\n```",
+                                        content=f"```html\n{video_html}\n```\n```json\n{metadata_json}\n```",
                                         finish_reason="STOP"
                                     )
                                     yield "data: [DONE]\n\n"
